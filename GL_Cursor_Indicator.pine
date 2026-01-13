@@ -1,0 +1,434 @@
+//@version=5
+indicator("GL Cursor", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GL CURSOR INDICATOR - Pine Script v5
+// ═══════════════════════════════════════════════════════════════════════════════
+// Purpose: Detect high-probability reversal setups using GL Leg, StdDev levels,
+//          PO3 logic, PD Arrays, and strict confluence requirements
+// Designed for: NQ1!/MNQ1! on 1-minute or lower timeframes
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 1: USER INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Session Times
+sessionGroup = "Session Settings"
+asiaStartTime = input.string("00:30", "Asia Session Start", group=sessionGroup)
+asiaEndTime = input.string("05:30", "Asia Session End", group=sessionGroup)
+lokzEndTime = input.string("08:30", "LoKZ End Time", group=sessionGroup)
+timezone = input.string("America/New_York", "Timezone", group=sessionGroup)
+
+// GL Leg & StdDev Settings
+glGroup = "GL Leg & StdDev Settings"
+k1 = input.float(0.5, "Inner Band Multiplier (k1)", minval=0.1, maxval=2.0, step=0.1, group=glGroup)
+k2 = input.float(1.0, "Extreme Band Multiplier (k2)", minval=0.5, maxval=3.0, step=0.1, group=glGroup)
+aggressiveMode = input.bool(false, "Aggressive Mode (use inner bands)", group=glGroup)
+
+// Reversal Confirmation Settings
+reversalGroup = "Reversal Confirmation Settings"
+sweepLookback = input.int(20, "Liquidity Sweep Lookback", minval=5, maxval=100, group=reversalGroup)
+bosLookback = input.int(5, "Micro BOS Lookback", minval=3, maxval=20, group=reversalGroup)
+rsiLength = input.int(3, "RSI Length", minval=2, maxval=14, group=reversalGroup)
+rsiPivotLen = input.int(5, "RSI Pivot Length (for divergence)", minval=2, maxval=10, group=reversalGroup)
+volumeMult = input.float(1.5, "Volume Spike Multiplier", minval=1.0, maxval=3.0, step=0.1, group=reversalGroup)
+vwapDevMult = input.float(1.0, "VWAP Deviation Multiplier (ATR)", minval=0.5, maxval=3.0, step=0.1, group=reversalGroup)
+
+// Signal Control Settings
+signalGroup = "Signal Control Settings"
+maxSignalsPerDay = input.int(2, "Max Signals Per Day", minval=1, maxval=10, group=signalGroup)
+signalCooldown = input.int(30, "Cooldown Between Signals (bars)", minval=5, maxval=100, group=signalGroup)
+fallbackMode = input.bool(true, "Enable Fallback Mode (relaxed if no signals)", group=signalGroup)
+
+// Risk Settings (Display Only)
+riskGroup = "Risk Settings (Visual Only)"
+stopLossPoints = input.float(10.0, "Stop Loss (Points)", minval=1.0, maxval=50.0, step=1.0, group=riskGroup)
+riskRewardRatio = input.float(3.0, "Risk:Reward Ratio", minval=1.0, maxval=10.0, step=0.5, group=riskGroup)
+showSLTP = input.bool(false, "Show SL/TP Lines", group=riskGroup)
+
+// Debug & Display Settings
+debugGroup = "Debug & Display Settings"
+debugMode = input.bool(false, "Debug Mode (Show All Levels)", group=debugGroup)
+showLabels = input.bool(true, "Show Signal Labels", group=debugGroup)
+showScore = input.bool(true, "Show Confluence Score in Label", group=debugGroup)
+
+// PD Array Confluence Settings
+pdGroup = "PD Array Settings"
+pdProximityPoints = input.float(10.0, "PD Array Proximity (Points)", minval=1.0, maxval=50.0, step=1.0, group=pdGroup)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 2: HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Check if current time is within a session
+inSession(startTime, endTime, tz) =>
+    t = time(timeframe.period, startTime + "-" + endTime + ":" + "1234567", tz)
+    not na(t)
+
+// Convert points to price (NQ: 1 point = 1.0 price unit)
+pointsToPrice(points) =>
+    points
+
+// Get session VWAP
+getSessionVWAP() =>
+    ta.vwap(hlc3)
+
+// Detect pivot highs and lows
+pivotHigh(len) =>
+    ta.pivothigh(high, len, len)
+
+pivotLow(len) =>
+    ta.pivotlow(low, len, len)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 3: GL LEG DETECTION (5-MINUTE TIMEFRAME)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Request 5-minute data (non-repainting)
+[high5m, low5m, close5m, open5m, time5m] = request.security(syminfo.tickerid, "5",
+     [high, low, close, open, time],
+     lookahead=barmerge.lookahead_off)
+
+// Track GL session variables
+var float glHigh = na
+var float glLow = na
+var float glMid = na
+var float glRange = na
+var int glDir = 0  // 1 = bullish, -1 = bearish, 0 = neutral
+var float glSessionHigh = na
+var float glSessionLow = na
+var float glSessionOpen = na
+var float glSessionClose = na
+var bool glSessionActive = false
+var bool glSessionComplete = false
+var int glSessionStartBar = na
+
+// Determine if we're in the GL session window (Asia to LoKZ)
+asiaSessionActive = inSession(asiaStartTime, asiaEndTime, timezone)
+lokzActive = inSession(asiaStartTime, lokzEndTime, timezone)
+
+// Initialize GL session on first bar of Asia session
+if asiaSessionActive and not glSessionActive
+    glSessionActive := true
+    glSessionComplete := false
+    glSessionHigh := high5m
+    glSessionLow := low5m
+    glSessionOpen := open5m
+    glSessionStartBar := bar_index
+
+// Update GL session high/low while session is active
+if glSessionActive and lokzActive
+    glSessionHigh := math.max(glSessionHigh, high5m)
+    glSessionLow := math.min(glSessionLow, low5m)
+    glSessionClose := close5m
+
+// Finalize GL leg when LoKZ period ends
+if glSessionActive and not lokzActive and not glSessionComplete
+    glSessionComplete := true
+    glSessionActive := false
+
+    // Calculate GL leg parameters
+    glHigh := glSessionHigh
+    glLow := glSessionLow
+    glRange := glHigh - glLow
+    glMid := (glHigh + glLow) / 2
+
+    // Determine direction (bullish if close > open, bearish otherwise)
+    glDir := glSessionClose > glSessionOpen ? 1 : -1
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 4: STDDEV LEVELS BASED ON GL LEG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var float upper1 = na
+var float upper2 = na
+var float lower1 = na
+var float lower2 = na
+
+if glSessionComplete and not na(glMid) and not na(glRange)
+    upper1 := glMid + k1 * glRange
+    upper2 := glMid + k2 * glRange
+    lower1 := glMid - k1 * glRange
+    lower2 := glMid - k2 * glRange
+
+// Plot GL levels in debug mode
+plot(debugMode and not na(glHigh) ? glHigh : na, "GL High", color.new(color.yellow, 0), 2, plot.style_line)
+plot(debugMode and not na(glLow) ? glLow : na, "GL Low", color.new(color.yellow, 0), 2, plot.style_line)
+plot(debugMode and not na(glMid) ? glMid : na, "GL Mid", color.new(color.orange, 50), 1, plot.style_line)
+plot(debugMode and not na(upper1) ? upper1 : na, "Upper 1", color.new(color.red, 50), 1, plot.style_circles)
+plot(debugMode and not na(upper2) ? upper2 : na, "Upper 2", color.new(color.red, 0), 2, plot.style_circles)
+plot(debugMode and not na(lower1) ? lower1 : na, "Lower 1", color.new(color.green, 50), 1, plot.style_circles)
+plot(debugMode and not na(lower2) ? lower2 : na, "Lower 2", color.new(color.green, 0), 2, plot.style_circles)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 5: PD ARRAYS (PREVIOUS DAY HIGH/LOW/CLOSE)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Get previous day's high, low, close
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1], close[1]],
+     lookahead=barmerge.lookahead_off)
+
+// Plot PD Arrays in debug mode
+plot(debugMode and not na(pdh) ? pdh : na, "PDH", color.new(color.purple, 50), 1, plot.style_cross)
+plot(debugMode and not na(pdl) ? pdl : na, "PDL", color.new(color.purple, 50), 1, plot.style_cross)
+plot(debugMode and not na(pdc) ? pdc : na, "PDC", color.new(color.gray, 50), 1, plot.style_cross)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 6: REVERSAL CONFIRMATION COMPONENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// A) EXTREME TRIGGER
+extremeUpperLevel = aggressiveMode ? upper1 : upper2
+extremeLowerLevel = aggressiveMode ? lower1 : lower2
+
+sellExtremeHit = not na(extremeUpperLevel) and high >= extremeUpperLevel
+buyExtremeHit = not na(extremeLowerLevel) and low <= extremeLowerLevel
+
+// B) LIQUIDITY SWEEP + REJECTION
+recentSwingHigh = ta.highest(high, sweepLookback)
+recentSwingLow = ta.lowest(low, sweepLookback)
+
+sellSweep = high > recentSwingHigh[1] and close < recentSwingHigh[1]
+buySweep = low < recentSwingLow[1] and close > recentSwingLow[1]
+
+// C) MOMENTUM SHIFT
+// C1) RSI Divergence Detection
+rsi = ta.rsi(close, rsiLength)
+
+// Detect pivots for divergence
+priceHigh = pivotHigh(rsiPivotLen)
+priceLow = pivotLow(rsiPivotLen)
+
+// Track last pivot values for divergence
+var float lastPriceHigh = na
+var float lastRsiHigh = na
+var float lastPriceLow = na
+var float lastRsiLow = na
+var int lastPriceHighBar = na
+var int lastPriceLowBar = na
+
+if not na(priceHigh)
+    lastPriceHigh := priceHigh
+    lastRsiHigh := rsi[rsiPivotLen]
+    lastPriceHighBar := bar_index - rsiPivotLen
+
+if not na(priceLow)
+    lastPriceLow := priceLow
+    lastRsiLow := rsi[rsiPivotLen]
+    lastPriceLowBar := bar_index - rsiPivotLen
+
+// Bearish divergence: price makes higher high, RSI makes lower high
+bearishDiv = not na(priceHigh) and not na(lastPriceHigh) and
+             priceHigh > lastPriceHigh and
+             rsi[rsiPivotLen] < lastRsiHigh and
+             (bar_index - lastPriceHighBar) > rsiPivotLen and
+             (bar_index - lastPriceHighBar) < 50
+
+// Bullish divergence: price makes lower low, RSI makes higher low
+bullishDiv = not na(priceLow) and not na(lastPriceLow) and
+             priceLow < lastPriceLow and
+             rsi[rsiPivotLen] > lastRsiLow and
+             (bar_index - lastPriceLowBar) > rsiPivotLen and
+             (bar_index - lastPriceLowBar) < 50
+
+// C2) Volume Spike
+volSMA = ta.sma(volume, 20)
+volumeSpike = volume > volSMA * volumeMult
+
+// D) VWAP DEVIATION FILTER
+vwap = getSessionVWAP()
+atr = ta.atr(14)
+vwapDevThreshold = atr * vwapDevMult
+
+sellVwapOK = close > vwap + vwapDevThreshold  // Price above VWAP for shorts
+buyVwapOK = close < vwap - vwapDevThreshold   // Price below VWAP for longs
+
+// Plot VWAP in debug mode
+plot(debugMode ? vwap : na, "VWAP", color.new(color.blue, 0), 2)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 7: PO3 LOGIC (MANIPULATION DETECTION)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// After GL session ends, watch for manipulation
+manipulationPhase = glSessionComplete and not lokzActive
+
+// Manipulation conditions
+sellManipulation = manipulationPhase and not na(glHigh) and
+                   (high > glHigh and close < glHigh) or
+                   (not na(upper2) and high >= upper2 and close < upper2)
+
+buyManipulation = manipulationPhase and not na(glLow) and
+                  (low < glLow and close > glLow) or
+                  (not na(lower2) and low <= lower2 and close > lower2)
+
+// Track manipulation state
+var bool sellManipDetected = false
+var bool buyManipDetected = false
+
+if sellManipulation
+    sellManipDetected := true
+if buyManipulation
+    buyManipDetected := true
+
+// Reset daily
+if ta.change(time("D"))
+    sellManipDetected := false
+    buyManipDetected := false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 8: MICRO BOS (BREAK OF STRUCTURE)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// For BUY: close breaks above recent swing high
+recentMicroHigh = ta.highest(high, bosLookback)
+buyBOS = close > recentMicroHigh[1]
+
+// For SELL: close breaks below recent swing low
+recentMicroLow = ta.lowest(low, bosLookback)
+sellBOS = close < recentMicroLow[1]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 9: PD ARRAY CONFLUENCE SCORING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pdProximity = pointsToPrice(pdProximityPoints)
+
+nearPDH = not na(pdh) and math.abs(close - pdh) <= pdProximity
+nearPDL = not na(pdl) and math.abs(close - pdl) <= pdProximity
+nearPDC = not na(pdc) and math.abs(close - pdc) <= pdProximity
+
+sellPDScore = nearPDH ? 1 : 0
+buyPDScore = nearPDL ? 1 : 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 10: SIGNAL GENERATION (STRICT MODE + FALLBACK)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Track signal counts and cooldown
+var int signalsToday = 0
+var int lastSignalBar = na
+
+// Reset daily counter
+if ta.change(time("D"))
+    signalsToday := 0
+    lastSignalBar := na
+    // Also reset GL session for new day
+    glSessionComplete := false
+    glSessionActive := false
+
+// Cooldown check
+cooldownOK = na(lastSignalBar) or (bar_index - lastSignalBar) >= signalCooldown
+
+// Check if we can issue more signals today
+canSignal = signalsToday < maxSignalsPerDay and cooldownOK
+
+// STRICT MODE: All confirmations required
+sellSetupStrict = sellExtremeHit and sellSweep and sellVwapOK and
+                  (bearishDiv or volumeSpike) and sellBOS and sellManipDetected
+
+buySetupStrict = buyExtremeHit and buySweep and buyVwapOK and
+                 (bullishDiv or volumeSpike) and buyBOS and buyManipDetected
+
+// FALLBACK MODE: Relax momentum requirement (either RSI div OR volume, not both)
+sellSetupFallback = sellExtremeHit and sellSweep and sellBOS and
+                    (bearishDiv or volumeSpike)
+
+buySetupFallback = buyExtremeHit and buySweep and buyBOS and
+                   (bullishDiv or volumeSpike)
+
+// Determine which mode to use
+useFallback = fallbackMode and signalsToday == 0 and hour >= 12  // Enable fallback after noon if no signals yet
+
+sellSignal = canSignal and (sellSetupStrict or (useFallback and sellSetupFallback))
+buySignal = canSignal and (buySetupStrict or (useFallback and buySetupFallback))
+
+// Calculate confluence score
+sellConfluenceScore = (sellExtremeHit ? 1 : 0) + (sellSweep ? 1 : 0) + (sellVwapOK ? 1 : 0) +
+                      (bearishDiv ? 1 : 0) + (volumeSpike ? 1 : 0) + (sellBOS ? 1 : 0) +
+                      (sellManipDetected ? 1 : 0) + sellPDScore
+
+buyConfluenceScore = (buyExtremeHit ? 1 : 0) + (buySweep ? 1 : 0) + (buyVwapOK ? 1 : 0) +
+                     (bullishDiv ? 1 : 0) + (volumeSpike ? 1 : 0) + (buyBOS ? 1 : 0) +
+                     (buyManipDetected ? 1 : 0) + buyPDScore
+
+// Update signal tracking
+if sellSignal or buySignal
+    signalsToday := signalsToday + 1
+    lastSignalBar := bar_index
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 11: VISUAL OUTPUT (ARROWS & LABELS)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Plot arrows
+plotshape(buySignal, "Buy Signal", shape.labelup, location.belowbar,
+          color.new(color.green, 0), text="BUY", textcolor=color.white, size=size.normal)
+
+plotshape(sellSignal, "Sell Signal", shape.labeldown, location.abovebar,
+          color.new(color.red, 0), text="SELL", textcolor=color.white, size=size.normal)
+
+// Create detailed labels if enabled
+if showLabels
+    if buySignal
+        slPrice = close - pointsToPrice(stopLossPoints)
+        tpPrice = close + pointsToPrice(stopLossPoints * riskRewardRatio)
+
+        labelText = "BUY\n" +
+                    "Entry: " + str.tostring(close, "#.##") + "\n" +
+                    "SL: " + str.tostring(stopLossPoints, "#") + "pts\n" +
+                    "TP: " + str.tostring(riskRewardRatio, "#.#") + "R"
+
+        if showScore
+            labelText := labelText + "\nScore: " + str.tostring(buyConfluenceScore) + "/8"
+
+        label.new(bar_index, low, labelText,
+                 style=label.style_label_up,
+                 color=color.new(color.green, 20),
+                 textcolor=color.white,
+                 size=size.small)
+
+        // Draw SL/TP lines if enabled
+        if showSLTP
+            line.new(bar_index, slPrice, bar_index + 10, slPrice,
+                    color=color.new(color.red, 50), width=1, style=line.style_dashed)
+            line.new(bar_index, tpPrice, bar_index + 10, tpPrice,
+                    color=color.new(color.green, 50), width=1, style=line.style_dashed)
+
+    if sellSignal
+        slPrice = close + pointsToPrice(stopLossPoints)
+        tpPrice = close - pointsToPrice(stopLossPoints * riskRewardRatio)
+
+        labelText = "SELL\n" +
+                    "Entry: " + str.tostring(close, "#.##") + "\n" +
+                    "SL: " + str.tostring(stopLossPoints, "#") + "pts\n" +
+                    "TP: " + str.tostring(riskRewardRatio, "#.#") + "R"
+
+        if showScore
+            labelText := labelText + "\nScore: " + str.tostring(sellConfluenceScore) + "/8"
+
+        label.new(bar_index, high, labelText,
+                 style=label.style_label_down,
+                 color=color.new(color.red, 20),
+                 textcolor=color.white,
+                 size=size.small)
+
+        // Draw SL/TP lines if enabled
+        if showSLTP
+            line.new(bar_index, slPrice, bar_index + 10, slPrice,
+                    color=color.new(color.red, 50), width=1, style=line.style_dashed)
+            line.new(bar_index, tpPrice, bar_index + 10, tpPrice,
+                    color=color.new(color.green, 50), width=1, style=line.style_dashed)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 12: ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(buySignal, "Buy Signal", "GL Cursor: BUY signal detected")
+alertcondition(sellSignal, "Sell Signal", "GL Cursor: SELL signal detected")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// END OF INDICATOR
+// ═══════════════════════════════════════════════════════════════════════════════
