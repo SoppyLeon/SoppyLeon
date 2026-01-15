@@ -1,0 +1,866 @@
+//@version=5
+indicator("STDEV Anchor Distribution Model", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STDEV ANCHOR DISTRIBUTION INDICATOR - Pine Script v5
+// ══════════════════════════════════════════════════════════════════════════════
+// Purpose: Detect manipulation/displacement leg in Late Asia/Early London,
+//          project Standard Deviation levels, and trade reversals at extremes
+//          during London Open / NY AM sessions.
+//
+// Designed for: NQ1!/MNQ1! (NASDAQ Futures) on 1m/5m/15m timeframes
+//
+// USAGE GUIDE:
+// 1. Apply to NQ futures chart on 1m, 5m, or 15m timeframe
+// 2. Configure session times for your timezone (default: America/New_York)
+// 3. Enable Debug Mode initially to verify anchor detection
+// 4. Adjust sweep tolerance (default 2-4 ticks) and displacement threshold
+// 5. Enable confluence filters based on your trading style
+// 6. Recommended: Start with ±2.0 extreme threshold, max 2 signals/day
+//
+// SELF-TEST CHECKLIST:
+// - Verify anchor leg appears in Late Asia/Early London window
+// - Check that STDEV levels project correctly from anchor end
+// - Confirm signals only fire at extremes (±2.0 or beyond)
+// - Validate no signals appear outside London Open/NY AM windows
+// - Test that signals don't repaint after bar close
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 1: USER INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Session Settings
+sessGroup = "═══ Session Settings ═══"
+useCustomSessions = input.bool(true, "Use Custom Time Inputs", group=sessGroup)
+asiaStart = input.string("18:00", "Asia Start (NY Time)", group=sessGroup)
+asiaEnd = input.string("00:00", "Asia End (NY Time)", group=sessGroup)
+londonAnchorStart = input.string("02:00", "London Anchor Window Start", group=sessGroup)
+londonAnchorEnd = input.string("07:00", "London Anchor Window End", group=sessGroup)
+londonOpenStart = input.string("02:00", "London Open Signal Window Start", group=sessGroup)
+londonOpenEnd = input.string("05:00", "London Open Signal Window End", group=sessGroup)
+nyAmStart = input.string("09:30", "NY AM Signal Window Start", group=sessGroup)
+nyAmEnd = input.string("11:30", "NY AM Signal Window End", group=sessGroup)
+sessionTimezone = input.string("America/New_York", "Timezone", group=sessGroup)
+
+// Anchor Detection Parameters
+anchorGroup = "═══ Anchor Detection Parameters ═══"
+pivotLeftBars = input.int(5, "Pivot Lookback (Left)", minval=1, maxval=50, group=anchorGroup)
+pivotRightBars = input.int(5, "Pivot Lookback (Right)", minval=1, maxval=50, group=anchorGroup)
+sweepToleranceTicks = input.float(2.0, "Sweep Tolerance (Ticks)", minval=0.25, maxval=20.0, step=0.25, group=anchorGroup)
+displacementBodyATR = input.float(0.8, "Displacement Body (ATR Multiple)", minval=0.3, maxval=3.0, step=0.1, group=anchorGroup)
+displacementMinPoints = input.float(20.0, "Displacement Min Move (Points)", minval=5.0, maxval=100.0, step=5.0, group=anchorGroup)
+impulseMaxBars = input.int(15, "Max Bars for Displacement Leg", minval=3, maxval=50, group=anchorGroup)
+anchorSelection = input.string("Earliest", "Anchor Selection", options=["Earliest", "Strongest"], group=anchorGroup)
+
+// STDEV Tool Parameters
+stdevGroup = "═══ STDEV Projection Parameters ═══"
+showStdev1 = input.bool(true, "Show ±1.0 Levels", group=stdevGroup, inline="sd1")
+showStdev15 = input.bool(true, "Show ±1.5 Levels", group=stdevGroup, inline="sd15")
+showStdev2 = input.bool(true, "Show ±2.0 Levels", group=stdevGroup, inline="sd2")
+showStdev25 = input.bool(true, "Show ±2.5 Levels", group=stdevGroup, inline="sd25")
+showStdev3 = input.bool(true, "Show ±3.0 Levels", group=stdevGroup, inline="sd3")
+showStdev4 = input.bool(true, "Show ±4.0 Levels", group=stdevGroup, inline="sd4")
+meanCalcMethod = input.string("End Price", "Mean Calculation", options=["End Price", "Midpoint"], group=stdevGroup)
+showSBZone = input.bool(true, "Show SBZ (1.0-1.5) Zone", group=stdevGroup)
+
+// Signal Thresholds
+signalGroup = "═══ Signal Generation Settings ═══"
+lowerExtremeThreshold = input.float(-2.0, "Lower Extreme Threshold (R)", minval=-4.0, maxval=-1.0, step=0.5, group=signalGroup)
+upperExtremeThreshold = input.float(2.0, "Upper Extreme Threshold (R)", minval=1.0, maxval=4.0, step=0.5, group=signalGroup)
+enableLondonSignals = input.bool(true, "Enable London Open Signals", group=signalGroup)
+enableNYSignals = input.bool(true, "Enable NY AM Signals", group=signalGroup)
+maxSignalsPerDay = input.int(2, "Max Signals Per Day", minval=1, maxval=10, group=signalGroup)
+minBarsBetweenSignals = input.int(20, "Min Bars Between Signals", minval=5, maxval=100, group=signalGroup)
+
+// Confluence Filters
+confGroup = "═══ Confluence Filters ═══"
+useLiquidityConf = input.bool(true, "Use Liquidity Confluence", group=confGroup)
+liquidityProximityPoints = input.float(10.0, "Liquidity Proximity (Points)", minval=1.0, maxval=50.0, step=1.0, group=confGroup)
+useFVGConf = input.bool(true, "Use FVG Confluence", group=confGroup)
+fvgProximityPoints = input.float(15.0, "FVG Proximity (Points)", minval=1.0, maxval=100.0, step=5.0, group=confGroup)
+useMSSConf = input.bool(true, "Use MSS/BOS Trigger", group=confGroup)
+mssLookback = input.int(10, "MSS Swing Lookback", minval=3, maxval=50, group=confGroup)
+
+// Risk/Target Visuals
+riskGroup = "═══ Risk Management (Visual Only) ═══"
+stopLossMethod = input.string("Beyond Extreme", "Stop Loss Method", options=["Beyond Extreme", "Recent Pivot"], group=riskGroup)
+stopLossPoints = input.float(10.0, "SL Points Beyond Extreme", minval=5.0, maxval=50.0, step=5.0, group=riskGroup)
+tp1Level = input.string("Mean (0)", "TP1 Target", options=["Mean (0)", "±0.5", "±1.0"], group=riskGroup)
+tp2Level = input.string("±1.5", "TP2 Target", options=["±1.0", "±1.5", "±2.0"], group=riskGroup)
+showSLTPLines = input.bool(true, "Show SL/TP Lines", group=riskGroup)
+
+// Visual Settings
+visualGroup = "═══ Visual Settings ═══"
+showAnchorLine = input.bool(true, "Show Anchor Leg Line", group=visualGroup)
+showSessionBoxes = input.bool(false, "Show Session Boxes", group=visualGroup)
+showSweepMarkers = input.bool(true, "Show Sweep Markers", group=visualGroup)
+showSignalLabels = input.bool(true, "Show Signal Labels", group=visualGroup)
+
+// Debug Mode
+debugGroup = "═══ Debug Mode ═══"
+debugMode = input.bool(false, "Enable Debug Mode", group=debugGroup)
+debugVerbose = input.bool(false, "Verbose Debug (Show All Checks)", group=debugGroup)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 2: CONSTANTS AND INITIALIZATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Convert ticks to points (NQ: 0.25 tick size, 4 ticks per point)
+tickSize = syminfo.mintick
+ticksPerPoint = 1.0 / tickSize
+sweepTolerancePoints = sweepToleranceTicks / 4.0
+
+// Color schemes
+COLOR_BULL = color.new(color.green, 0)
+COLOR_BEAR = color.new(color.red, 0)
+COLOR_NEUTRAL = color.new(color.gray, 50)
+COLOR_ANCHOR = color.new(color.orange, 0)
+COLOR_STDEV = color.new(color.blue, 30)
+COLOR_EXTREME = color.new(color.purple, 50)
+COLOR_SBZ = color.new(color.yellow, 85)
+
+// State variables - Daily anchor tracking
+var float anchorStartPrice = na
+var float anchorEndPrice = na
+var int anchorStartBar = na
+var int anchorEndBar = na
+var int anchorDirection = 0  // 1 = bullish displacement, -1 = bearish displacement
+var float anchorRange = na
+var bool anchorFound = false
+var string anchorSweepType = ""
+var float anchorDisplacementStrength = na
+
+// State variables - STDEV levels
+var float meanLevel = na
+var float stdevPlus1 = na
+var float stdevPlus15 = na
+var float stdevPlus2 = na
+var float stdevPlus25 = na
+var float stdevPlus3 = na
+var float stdevPlus4 = na
+var float stdevMinus1 = na
+var float stdevMinus15 = na
+var float stdevMinus2 = na
+var float stdevMinus25 = na
+var float stdevMinus3 = na
+var float stdevMinus4 = na
+
+// State variables - Signal tracking
+var int signalsToday = 0
+var int lastSignalBar = na
+var int currentDayTimestamp = na
+
+// State variables - Session tracking
+var float asiaHigh = na
+var float asiaLow = na
+var float londonHigh = na
+var float londonLow = na
+var float prevDayHigh = na
+var float prevDayLow = na
+
+// State variables - FVG tracking
+var float bullishFVGHigh = na
+var float bullishFVGLow = na
+var float bearishFVGHigh = na
+var float bearishFVGLow = na
+var bool bullishFVGActive = false
+var bool bearishFVGActive = false
+
+// Drawing objects (reusable to stay within limits)
+var line anchorLine = na
+var line meanLine = na
+var line stdevP1Line = na
+var line stdevP15Line = na
+var line stdevP2Line = na
+var line stdevP25Line = na
+var line stdevP3Line = na
+var line stdevP4Line = na
+var line stdevM1Line = na
+var line stdevM15Line = na
+var line stdevM2Line = na
+var line stdevM25Line = na
+var line stdevM3Line = na
+var line stdevM4Line = na
+var box sbzUpperBox = na
+var box sbzLowerBox = na
+var label debugLabel = na
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 3: HELPER FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Check if current bar is in session
+inSession(startTime, endTime) =>
+    if not useCustomSessions
+        true
+    else
+        sessionStr = startTime + "-" + endTime + ":1234567"
+        t = time(timeframe.period, sessionStr, sessionTimezone)
+        not na(t)
+
+// Calculate ATR for displacement threshold
+atr = ta.atr(14)
+
+// Get confirmed pivots (non-repainting)
+confirmedPivotHigh = ta.pivothigh(high, pivotLeftBars, pivotRightBars)
+confirmedPivotLow = ta.pivotlow(low, pivotLeftBars, pivotRightBars)
+
+// Track most recent confirmed swing levels for MSS detection
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var int lastSwingHighBar = na
+var int lastSwingLowBar = na
+
+if not na(confirmedPivotHigh)
+    lastSwingHigh := confirmedPivotHigh
+    lastSwingHighBar := bar_index - pivotRightBars
+
+if not na(confirmedPivotLow)
+    lastSwingLow := confirmedPivotLow
+    lastSwingLowBar := bar_index - pivotRightBars
+
+// Calculate body size
+bodySize = math.abs(close - open)
+bodyPercent = close > open ? 1 : close < open ? -1 : 0
+
+// Points conversion helpers
+pointsToPrice(points) => points * tickSize * 4
+priceToPoints(priceMove) => priceMove / (tickSize * 4)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 4: DAILY RESET LOGIC
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Detect new trading day
+newDay = ta.change(time("D")) != 0
+
+if newDay
+    // Reset anchor detection
+    anchorFound := false
+    anchorStartPrice := na
+    anchorEndPrice := na
+    anchorStartBar := na
+    anchorEndBar := na
+    anchorDirection := 0
+    anchorRange := na
+    anchorSweepType := ""
+    anchorDisplacementStrength := na
+
+    // Reset STDEV levels
+    meanLevel := na
+    stdevPlus1 := na
+    stdevPlus15 := na
+    stdevPlus2 := na
+    stdevPlus25 := na
+    stdevPlus3 := na
+    stdevPlus4 := na
+    stdevMinus1 := na
+    stdevMinus15 := na
+    stdevMinus2 := na
+    stdevMinus25 := na
+    stdevMinus3 := na
+    stdevMinus4 := na
+
+    // Reset signals
+    signalsToday := 0
+    lastSignalBar := na
+    currentDayTimestamp := time
+
+    // Reset session levels
+    asiaHigh := na
+    asiaLow := na
+    londonHigh := na
+    londonLow := na
+
+    // Store previous day high/low
+    prevDayHigh := ta.valuewhen(ta.change(time("D")) != 0, ta.highest(high, 1)[1], 0)
+    prevDayLow := ta.valuewhen(ta.change(time("D")) != 0, ta.lowest(low, 1)[1], 0)
+
+    // Reset FVG tracking
+    bullishFVGActive := false
+    bearishFVGActive := false
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 5: SESSION TRACKING
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Track session highs/lows
+inAsiaSession = inSession(asiaStart, asiaEnd)
+inLondonAnchorWindow = inSession(londonAnchorStart, londonAnchorEnd)
+inLondonOpenWindow = inSession(londonOpenStart, londonOpenEnd)
+inNYAMWindow = inSession(nyAmStart, nyAmEnd)
+
+if inAsiaSession
+    asiaHigh := na(asiaHigh) ? high : math.max(asiaHigh, high)
+    asiaLow := na(asiaLow) ? low : math.min(asiaLow, low)
+
+if inLondonAnchorWindow or inLondonOpenWindow
+    londonHigh := na(londonHigh) ? high : math.max(londonHigh, high)
+    londonLow := na(londonLow) ? low : math.min(londonLow, low)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 6: ANCHOR LEG DETECTION - LIQUIDITY SWEEP
+// ══════════════════════════════════════════════════════════════════════════════
+
+var bool sweepDetected = false
+var bool buySideSweep = false  // Sweep above pivot high
+var bool sellSideSweep = false // Sweep below pivot low
+var int sweepBar = na
+var float sweepPivotLevel = na
+
+// Only detect sweeps in the anchor window and if anchor not yet found
+if inLondonAnchorWindow and not anchorFound and not sweepDetected
+
+    // Check for buy-side sweep (sweep above pivot high, then close below)
+    if not na(lastSwingHigh)
+        sweepThreshold = lastSwingHigh + pointsToPrice(sweepTolerancePoints)
+        if high >= sweepThreshold and close < lastSwingHigh
+            sweepDetected := true
+            buySideSweep := true
+            sellSideSweep := false
+            sweepBar := bar_index
+            sweepPivotLevel := lastSwingHigh
+            if debugMode and debugVerbose
+                label.new(bar_index, high, "Buy Sweep", style=label.style_label_down,
+                         color=COLOR_BEAR, textcolor=color.white, size=size.tiny)
+
+    // Check for sell-side sweep (sweep below pivot low, then close above)
+    if not na(lastSwingLow) and not sweepDetected
+        sweepThreshold = lastSwingLow - pointsToPrice(sweepTolerancePoints)
+        if low <= sweepThreshold and close > lastSwingLow
+            sweepDetected := true
+            sellSideSweep := true
+            buySideSweep := false
+            sweepBar := bar_index
+            sweepPivotLevel := lastSwingLow
+            if debugMode and debugVerbose
+                label.new(bar_index, low, "Sell Sweep", style=label.style_label_up,
+                         color=COLOR_BULL, textcolor=color.white, size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 7: ANCHOR LEG DETECTION - DISPLACEMENT CONFIRMATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+var bool displacementActive = false
+var int displacementStartBar = na
+var float displacementStartPrice = na
+var int displacementBarCount = 0
+
+// After sweep detected, look for displacement
+if sweepDetected and not anchorFound and not displacementActive
+
+    // For buy-side sweep, expect BEARISH displacement (down)
+    if buySideSweep
+        // Strong bearish candle
+        isBearishImpulse = close < open and bodySize >= displacementBodyATR * atr
+        if isBearishImpulse
+            displacementActive := true
+            displacementStartBar := bar_index
+            displacementStartPrice := open
+            displacementBarCount := 1
+            if debugMode and debugVerbose
+                label.new(bar_index, high, "↓ Disp", style=label.style_label_down,
+                         color=COLOR_BEAR, textcolor=color.white, size=size.tiny)
+
+    // For sell-side sweep, expect BULLISH displacement (up)
+    if sellSideSweep
+        // Strong bullish candle
+        isBullishImpulse = close > open and bodySize >= displacementBodyATR * atr
+        if isBullishImpulse
+            displacementActive := true
+            displacementStartBar := bar_index
+            displacementStartPrice := open
+            displacementBarCount := 1
+            if debugMode and debugVerbose
+                label.new(bar_index, low, "↑ Disp", style=label.style_label_up,
+                         color=COLOR_BULL, textcolor=color.white, size=size.tiny)
+
+// Track displacement continuation
+if displacementActive and not anchorFound
+    displacementBarCount += 1
+
+    currentMove = math.abs(close - displacementStartPrice)
+    moveInPoints = priceToPoints(currentMove)
+
+    // Check if displacement is complete
+    isDisplacementComplete = false
+
+    // Completion conditions:
+    // 1. Reached max bars
+    if displacementBarCount >= impulseMaxBars
+        isDisplacementComplete := true
+
+    // 2. Momentum pause (small body or opposite direction)
+    if bodySize < 0.3 * atr or
+       (buySideSweep and close > close[1]) or
+       (sellSideSweep and close < close[1])
+        if displacementBarCount >= 3  // Minimum 3 bars
+            isDisplacementComplete := true
+
+    // If displacement complete, validate and create anchor
+    if isDisplacementComplete
+        // Validate minimum move requirement
+        if moveInPoints >= displacementMinPoints
+            // Create anchor
+            anchorFound := true
+            anchorStartPrice := displacementStartPrice
+            anchorEndPrice := close
+            anchorStartBar := displacementStartBar
+            anchorEndBar := bar_index
+            anchorRange := math.abs(anchorEndPrice - anchorStartPrice)
+            anchorDirection := buySideSweep ? -1 : 1  // Buy sweep = bearish displacement
+            anchorSweepType := buySideSweep ? "Buy-Side Sweep" : "Sell-Side Sweep"
+            anchorDisplacementStrength := moveInPoints
+
+            if debugMode
+                labelTxt = "✓ ANCHOR FOUND\n" +
+                          anchorSweepType + "\n" +
+                          "Displacement: " + str.tostring(moveInPoints, "#.#") + " pts\n" +
+                          "Range (R): " + str.tostring(priceToPoints(anchorRange), "#.#") + " pts"
+                label.new(bar_index, anchorDirection > 0 ? low : high, labelTxt,
+                         style=anchorDirection > 0 ? label.style_label_up : label.style_label_down,
+                         color=COLOR_ANCHOR, textcolor=color.white, size=size.normal)
+        else
+            if debugMode and debugVerbose
+                label.new(bar_index, close, "✗ Disp too weak",
+                         style=label.style_label_left, color=COLOR_NEUTRAL,
+                         textcolor=color.white, size=size.tiny)
+
+        // Reset displacement tracking
+        displacementActive := false
+        sweepDetected := false
+        displacementBarCount := 0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 8: STDEV LEVEL CALCULATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+if anchorFound and na(meanLevel)
+    // Calculate mean
+    meanLevel := meanCalcMethod == "Midpoint" ?
+                 (anchorStartPrice + anchorEndPrice) / 2 :
+                 anchorEndPrice
+
+    // Calculate STDEV levels based on direction
+    // For bullish displacement (up), project levels upward
+    // For bearish displacement (down), project levels downward
+
+    if anchorDirection > 0  // Bullish displacement
+        stdevPlus1 := anchorEndPrice + anchorRange * 1.0
+        stdevPlus15 := anchorEndPrice + anchorRange * 1.5
+        stdevPlus2 := anchorEndPrice + anchorRange * 2.0
+        stdevPlus25 := anchorEndPrice + anchorRange * 2.5
+        stdevPlus3 := anchorEndPrice + anchorRange * 3.0
+        stdevPlus4 := anchorEndPrice + anchorRange * 4.0
+
+        stdevMinus1 := anchorEndPrice - anchorRange * 1.0
+        stdevMinus15 := anchorEndPrice - anchorRange * 1.5
+        stdevMinus2 := anchorEndPrice - anchorRange * 2.0
+        stdevMinus25 := anchorEndPrice - anchorRange * 2.5
+        stdevMinus3 := anchorEndPrice - anchorRange * 3.0
+        stdevMinus4 := anchorEndPrice - anchorRange * 4.0
+
+    else  // Bearish displacement
+        stdevMinus1 := anchorEndPrice - anchorRange * 1.0
+        stdevMinus15 := anchorEndPrice - anchorRange * 1.5
+        stdevMinus2 := anchorEndPrice - anchorRange * 2.0
+        stdevMinus25 := anchorEndPrice - anchorRange * 2.5
+        stdevMinus3 := anchorEndPrice - anchorRange * 3.0
+        stdevMinus4 := anchorEndPrice - anchorRange * 4.0
+
+        stdevPlus1 := anchorEndPrice + anchorRange * 1.0
+        stdevPlus15 := anchorEndPrice + anchorRange * 1.5
+        stdevPlus2 := anchorEndPrice + anchorRange * 2.0
+        stdevPlus25 := anchorEndPrice + anchorRange * 2.5
+        stdevPlus3 := anchorEndPrice + anchorRange * 3.0
+        stdevPlus4 := anchorEndPrice + anchorRange * 4.0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 9: CONFLUENCE FILTERS - FVG DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Detect Fair Value Gaps (3-candle imbalance)
+// Bullish FVG: low[0] > high[2] (gap up)
+// Bearish FVG: high[0] < low[2] (gap down)
+
+if barstate.isconfirmed  // Only on closed bars
+    // Bullish FVG
+    if low > high[2]
+        bullishFVGLow := high[2]
+        bullishFVGHigh := low
+        bullishFVGActive := true
+        if debugMode and debugVerbose
+            box.new(bar_index[2], bullishFVGLow, bar_index, bullishFVGHigh,
+                   border_color=COLOR_BULL, bgcolor=color.new(COLOR_BULL, 90),
+                   border_width=1)
+
+    // Bearish FVG
+    if high < low[2]
+        bearishFVGHigh := low[2]
+        bearishFVGLow := high
+        bearishFVGActive := true
+        if debugMode and debugVerbose
+            box.new(bar_index[2], bearishFVGLow, bar_index, bearishFVGHigh,
+                   border_color=COLOR_BEAR, bgcolor=color.new(COLOR_BEAR, 90),
+                   border_width=1)
+
+// Check if price is near FVG
+nearBullishFVG = bullishFVGActive and not na(bullishFVGLow) and
+                 math.abs(close - bullishFVGLow) <= pointsToPrice(fvgProximityPoints)
+
+nearBearishFVG = bearishFVGActive and not na(bearishFVGHigh) and
+                 math.abs(close - bearishFVGHigh) <= pointsToPrice(fvgProximityPoints)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 10: CONFLUENCE FILTERS - LIQUIDITY ZONES
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Check proximity to key liquidity levels
+proximityThreshold = pointsToPrice(liquidityProximityPoints)
+
+nearAsiaHigh = not na(asiaHigh) and math.abs(close - asiaHigh) <= proximityThreshold
+nearAsiaLow = not na(asiaLow) and math.abs(close - asiaLow) <= proximityThreshold
+nearLondonHigh = not na(londonHigh) and math.abs(close - londonHigh) <= proximityThreshold
+nearLondonLow = not na(londonLow) and math.abs(close - londonLow) <= proximityThreshold
+nearPrevDayHigh = not na(prevDayHigh) and math.abs(close - prevDayHigh) <= proximityThreshold
+nearPrevDayLow = not na(prevDayLow) and math.abs(close - prevDayLow) <= proximityThreshold
+
+// Liquidity confluence for shorts (near highs)
+liquidityConfShort = nearAsiaHigh or nearLondonHigh or nearPrevDayHigh
+
+// Liquidity confluence for longs (near lows)
+liquidityConfLong = nearAsiaLow or nearLondonLow or nearPrevDayLow
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 11: CONFLUENCE FILTERS - MSS/BOS DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Market Structure Shift detection (confirmed, non-repainting)
+// MSS Up: Price breaks above last confirmed swing high
+// MSS Down: Price breaks below last confirmed swing low
+
+var bool mssUpTriggered = false
+var bool mssDownTriggered = false
+
+// Reset MSS flags on new day
+if newDay
+    mssUpTriggered := false
+    mssDownTriggered := false
+
+// Detect MSS on confirmed bars only
+if barstate.isconfirmed
+    // MSS Up: close breaks above last swing high
+    if not na(lastSwingHigh) and close > lastSwingHigh and not mssUpTriggered
+        mssUpTriggered := true
+        mssDownTriggered := false  // Reset opposite
+        if debugMode and debugVerbose
+            label.new(bar_index, low, "MSS↑", style=label.style_label_up,
+                     color=COLOR_BULL, textcolor=color.white, size=size.tiny)
+
+    // MSS Down: close breaks below last swing low
+    if not na(lastSwingLow) and close < lastSwingLow and not mssDownTriggered
+        mssDownTriggered := true
+        mssUpTriggered := false  // Reset opposite
+        if debugMode and debugVerbose
+            label.new(bar_index, high, "MSS↓", style=label.style_label_down,
+                     color=COLOR_BEAR, textcolor=color.white, size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 12: SIGNAL GENERATION LOGIC
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Check if we're in valid signal window
+inSignalWindow = (enableLondonSignals and inLondonOpenWindow) or
+                 (enableNYSignals and inNYAMWindow)
+
+// Check signal throttling
+canGenerateSignal = signalsToday < maxSignalsPerDay and
+                    (na(lastSignalBar) or (bar_index - lastSignalBar) >= minBarsBetweenSignals)
+
+// SHORT SIGNAL CONDITIONS
+// - Price at or above upper extreme threshold
+// - Confluence filters pass (if enabled)
+// - MSS down triggered (if enabled)
+// - In valid signal window
+// - Not throttled
+
+atUpperExtreme = not na(stdevPlus2) and close >= (anchorEndPrice + anchorRange * upperExtremeThreshold)
+
+shortConfluencePass = true
+if useLiquidityConf
+    shortConfluencePass := shortConfluencePass and liquidityConfShort
+if useFVGConf
+    shortConfluencePass := shortConfluencePass and nearBearishFVG
+if useMSSConf
+    shortConfluencePass := shortConfluencePass and mssDownTriggered
+
+shortSignal = barstate.isconfirmed and
+              anchorFound and
+              inSignalWindow and
+              canGenerateSignal and
+              atUpperExtreme and
+              shortConfluencePass
+
+// LONG SIGNAL CONDITIONS
+// - Price at or below lower extreme threshold
+// - Confluence filters pass (if enabled)
+// - MSS up triggered (if enabled)
+// - In valid signal window
+// - Not throttled
+
+atLowerExtreme = not na(stdevMinus2) and close <= (anchorEndPrice + anchorRange * lowerExtremeThreshold)
+
+longConfluencePass = true
+if useLiquidityConf
+    longConfluencePass := longConfluencePass and liquidityConfLong
+if useFVGConf
+    longConfluencePass := longConfluencePass and nearBullishFVG
+if useMSSConf
+    longConfluencePass := longConfluencePass and mssUpTriggered
+
+longSignal = barstate.isconfirmed and
+             anchorFound and
+             inSignalWindow and
+             canGenerateSignal and
+             atLowerExtreme and
+             longConfluencePass
+
+// Update signal tracking
+if shortSignal or longSignal
+    signalsToday += 1
+    lastSignalBar := bar_index
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 13: VISUAL OUTPUT - DRAWING OBJECTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Draw anchor leg line
+if anchorFound and showAnchorLine
+    if na(anchorLine)
+        anchorLine := line.new(anchorStartBar, anchorStartPrice, anchorEndBar, anchorEndPrice,
+                              color=COLOR_ANCHOR, width=3, style=line.style_solid)
+    else
+        line.set_xy1(anchorLine, anchorStartBar, anchorStartPrice)
+        line.set_xy2(anchorLine, anchorEndBar, anchorEndPrice)
+        line.set_color(anchorLine, COLOR_ANCHOR)
+
+// Draw STDEV levels (reuse lines)
+currentBar = bar_index
+extendBars = 200
+
+// Mean level
+if not na(meanLevel)
+    if na(meanLine)
+        meanLine := line.new(currentBar, meanLevel, currentBar + extendBars, meanLevel,
+                            color=COLOR_ANCHOR, width=2, style=line.style_solid)
+    else
+        line.set_xy1(meanLine, currentBar - 50, meanLevel)
+        line.set_xy2(meanLine, currentBar + extendBars, meanLevel)
+
+// Positive levels
+if showStdev1 and not na(stdevPlus1)
+    if na(stdevP1Line)
+        stdevP1Line := line.new(currentBar, stdevPlus1, currentBar + extendBars, stdevPlus1,
+                               color=COLOR_STDEV, width=1, style=line.style_dashed)
+    else
+        line.set_xy1(stdevP1Line, currentBar - 50, stdevPlus1)
+        line.set_xy2(stdevP1Line, currentBar + extendBars, stdevPlus1)
+
+if showStdev15 and not na(stdevPlus15)
+    if na(stdevP15Line)
+        stdevP15Line := line.new(currentBar, stdevPlus15, currentBar + extendBars, stdevPlus15,
+                                color=COLOR_STDEV, width=1, style=line.style_dashed)
+    else
+        line.set_xy1(stdevP15Line, currentBar - 50, stdevPlus15)
+        line.set_xy2(stdevP15Line, currentBar + extendBars, stdevPlus15)
+
+if showStdev2 and not na(stdevPlus2)
+    if na(stdevP2Line)
+        stdevP2Line := line.new(currentBar, stdevPlus2, currentBar + extendBars, stdevPlus2,
+                               color=COLOR_EXTREME, width=2, style=line.style_solid)
+    else
+        line.set_xy1(stdevP2Line, currentBar - 50, stdevPlus2)
+        line.set_xy2(stdevP2Line, currentBar + extendBars, stdevPlus2)
+
+if showStdev25 and not na(stdevPlus25)
+    if na(stdevP25Line)
+        stdevP25Line := line.new(currentBar, stdevPlus25, currentBar + extendBars, stdevPlus25,
+                                color=COLOR_EXTREME, width=1, style=line.style_dotted)
+    else
+        line.set_xy1(stdevP25Line, currentBar - 50, stdevPlus25)
+        line.set_xy2(stdevP25Line, currentBar + extendBars, stdevPlus25)
+
+if showStdev3 and not na(stdevPlus3)
+    if na(stdevP3Line)
+        stdevP3Line := line.new(currentBar, stdevPlus3, currentBar + extendBars, stdevPlus3,
+                               color=COLOR_EXTREME, width=2, style=line.style_solid)
+    else
+        line.set_xy1(stdevP3Line, currentBar - 50, stdevPlus3)
+        line.set_xy2(stdevP3Line, currentBar + extendBars, stdevPlus3)
+
+if showStdev4 and not na(stdevPlus4)
+    if na(stdevP4Line)
+        stdevP4Line := line.new(currentBar, stdevPlus4, currentBar + extendBars, stdevPlus4,
+                               color=COLOR_EXTREME, width=1, style=line.style_dotted)
+    else
+        line.set_xy1(stdevP4Line, currentBar - 50, stdevPlus4)
+        line.set_xy2(stdevP4Line, currentBar + extendBars, stdevPlus4)
+
+// Negative levels
+if showStdev1 and not na(stdevMinus1)
+    if na(stdevM1Line)
+        stdevM1Line := line.new(currentBar, stdevMinus1, currentBar + extendBars, stdevMinus1,
+                               color=COLOR_STDEV, width=1, style=line.style_dashed)
+    else
+        line.set_xy1(stdevM1Line, currentBar - 50, stdevMinus1)
+        line.set_xy2(stdevM1Line, currentBar + extendBars, stdevMinus1)
+
+if showStdev15 and not na(stdevMinus15)
+    if na(stdevM15Line)
+        stdevM15Line := line.new(currentBar, stdevMinus15, currentBar + extendBars, stdevMinus15,
+                                color=COLOR_STDEV, width=1, style=line.style_dashed)
+    else
+        line.set_xy1(stdevM15Line, currentBar - 50, stdevMinus15)
+        line.set_xy2(stdevM15Line, currentBar + extendBars, stdevMinus15)
+
+if showStdev2 and not na(stdevMinus2)
+    if na(stdevM2Line)
+        stdevM2Line := line.new(currentBar, stdevMinus2, currentBar + extendBars, stdevMinus2,
+                               color=COLOR_EXTREME, width=2, style=line.style_solid)
+    else
+        line.set_xy1(stdevM2Line, currentBar - 50, stdevMinus2)
+        line.set_xy2(stdevM2Line, currentBar + extendBars, stdevMinus2)
+
+if showStdev25 and not na(stdevMinus25)
+    if na(stdevM25Line)
+        stdevM25Line := line.new(currentBar, stdevMinus25, currentBar + extendBars, stdevMinus25,
+                                color=COLOR_EXTREME, width=1, style=line.style_dotted)
+    else
+        line.set_xy1(stdevM25Line, currentBar - 50, stdevMinus25)
+        line.set_xy2(stdevM25Line, currentBar + extendBars, stdevMinus25)
+
+if showStdev3 and not na(stdevMinus3)
+    if na(stdevM3Line)
+        stdevM3Line := line.new(currentBar, stdevMinus3, currentBar + extendBars, stdevMinus3,
+                               color=COLOR_EXTREME, width=2, style=line.style_solid)
+    else
+        line.set_xy1(stdevM3Line, currentBar - 50, stdevMinus3)
+        line.set_xy2(stdevM3Line, currentBar + extendBars, stdevMinus3)
+
+if showStdev4 and not na(stdevMinus4)
+    if na(stdevM4Line)
+        stdevM4Line := line.new(currentBar, stdevMinus4, currentBar + extendBars, stdevMinus4,
+                               color=COLOR_EXTREME, width=1, style=line.style_dotted)
+    else
+        line.set_xy1(stdevM4Line, currentBar - 50, stdevMinus4)
+        line.set_xy2(stdevM4Line, currentBar + extendBars, stdevMinus4)
+
+// Draw SBZ zones (1.0 to 1.5)
+if showSBZone and not na(stdevPlus1) and not na(stdevPlus15)
+    if na(sbzUpperBox)
+        sbzUpperBox := box.new(currentBar, stdevPlus1, currentBar + extendBars, stdevPlus15,
+                              border_color=na, bgcolor=COLOR_SBZ)
+    else
+        box.set_lefttop(sbzUpperBox, currentBar - 50, stdevPlus15)
+        box.set_rightbottom(sbzUpperBox, currentBar + extendBars, stdevPlus1)
+
+if showSBZone and not na(stdevMinus1) and not na(stdevMinus15)
+    if na(sbzLowerBox)
+        sbzLowerBox := box.new(currentBar, stdevMinus15, currentBar + extendBars, stdevMinus1,
+                              border_color=na, bgcolor=COLOR_SBZ)
+    else
+        box.set_lefttop(sbzLowerBox, currentBar - 50, stdevMinus1)
+        box.set_rightbottom(sbzLowerBox, currentBar + extendBars, stdevMinus15)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 14: SIGNAL LABELS AND ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// SHORT signal label
+if shortSignal and showSignalLabels
+    // Calculate SL and TP
+    slPrice = stopLossMethod == "Beyond Extreme" ?
+              stdevPlus3 + pointsToPrice(stopLossPoints) :
+              lastSwingHigh + pointsToPrice(stopLossPoints)
+
+    tp1Price = tp1Level == "Mean (0)" ? meanLevel :
+               tp1Level == "±0.5" ? anchorEndPrice + anchorRange * 0.5 :
+               stdevPlus1
+
+    tp2Price = tp2Level == "±1.0" ? stdevPlus1 :
+               tp2Level == "±1.5" ? stdevPlus15 :
+               stdevPlus2
+
+    slPoints = priceToPoints(math.abs(close - slPrice))
+    tp1Points = priceToPoints(math.abs(close - tp1Price))
+
+    labelText = "SELL\n" +
+                "Entry: " + str.tostring(close, format.mintick) + "\n" +
+                "SL: " + str.tostring(slPoints, "#.#") + " pts\n" +
+                "TP1: " + str.tostring(tp1Points, "#.#") + " pts"
+
+    label.new(bar_index, high, labelText,
+             style=label.style_label_down,
+             color=COLOR_BEAR, textcolor=color.white,
+             size=size.normal, yloc=yloc.abovebar)
+
+    // Draw SL/TP lines
+    if showSLTPLines
+        line.new(bar_index, slPrice, bar_index + 20, slPrice,
+                color=color.new(COLOR_BEAR, 50), width=2, style=line.style_dashed)
+        line.new(bar_index, tp1Price, bar_index + 20, tp1Price,
+                color=color.new(COLOR_BULL, 50), width=2, style=line.style_dashed)
+
+// LONG signal label
+if longSignal and showSignalLabels
+    // Calculate SL and TP
+    slPrice = stopLossMethod == "Beyond Extreme" ?
+              stdevMinus3 - pointsToPrice(stopLossPoints) :
+              lastSwingLow - pointsToPrice(stopLossPoints)
+
+    tp1Price = tp1Level == "Mean (0)" ? meanLevel :
+               tp1Level == "±0.5" ? anchorEndPrice - anchorRange * 0.5 :
+               stdevMinus1
+
+    tp2Price = tp2Level == "±1.0" ? stdevMinus1 :
+               tp2Level == "±1.5" ? stdevMinus15 :
+               stdevMinus2
+
+    slPoints = priceToPoints(math.abs(close - slPrice))
+    tp1Points = priceToPoints(math.abs(close - tp1Price))
+
+    labelText = "BUY\n" +
+                "Entry: " + str.tostring(close, format.mintick) + "\n" +
+                "SL: " + str.tostring(slPoints, "#.#") + " pts\n" +
+                "TP1: " + str.tostring(tp1Points, "#.#") + " pts"
+
+    label.new(bar_index, low, labelText,
+             style=label.style_label_up,
+             color=COLOR_BULL, textcolor=color.white,
+             size=size.normal, yloc=yloc.belowbar)
+
+    // Draw SL/TP lines
+    if showSLTPLines
+        line.new(bar_index, slPrice, bar_index + 20, slPrice,
+                color=color.new(COLOR_BEAR, 50), width=2, style=line.style_dashed)
+        line.new(bar_index, tp1Price, bar_index + 20, tp1Price,
+                color=color.new(COLOR_BULL, 50), width=2, style=line.style_dashed)
+
+// Plot signals on chart
+plotshape(shortSignal, "Short Signal", shape.triangledown, location.abovebar,
+         COLOR_BEAR, size=size.small)
+plotshape(longSignal, "Long Signal", shape.triangleup, location.belowbar,
+         COLOR_BULL, size=size.small)
+
+// Alerts
+alertcondition(shortSignal, "Short Signal", "STDEV Anchor: SHORT signal at extreme")
+alertcondition(longSignal, "Long Signal", "STDEV Anchor: LONG signal at extreme")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// END OF INDICATOR
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Debug info plot (bottom pane)
+plot(debugMode and anchorFound ? priceToPoints(anchorRange) : na,
+     "Anchor Range (pts)", color=COLOR_ANCHOR, style=plot.style_histogram)
